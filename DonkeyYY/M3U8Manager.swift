@@ -28,7 +28,7 @@ class LocalHLSServer {
         guard bindOK == 0 else { return nil }
         listen(listenSocket, 10)
         var addrLen = socklen_t(MemoryLayout<sockaddr_in>.size)
-        var actualAddr = sockaddr_in()
+        var actualAddr = sockaddr_in(sin_len: 0, sin_family: 0, sin_port: 0, sin_addr: in_addr(s_addr: 0), sin_zero: (0,0,0,0,0,0,0,0))
         getsockname(listenSocket, UnsafeMutablePointer(&actualAddr), &addrLen)
         port = actualAddr.sin_port.bigEndian
         isRunning = true
