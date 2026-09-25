@@ -10,13 +10,14 @@ class TSToMP4Converter {
             throw NSError(domain: "TSToMP4", code: 1, userInfo: [NSLocalizedDescriptionKey: "TS文件为空"])
         }
         
-        // 1. 解析所有TS包
-        var packets: [(pid: UInt16, payload: Data)] = []
+        // 1. 解析所有TS包，按PID收集payload（处理payload_unit_start_indicator）
+        var pidPayloads: [UInt16: Data] = [:]
         var offset = 0
         while offset + 188 <= tsData.count {
             if tsData[offset] == 0x47 {
                 let pid = (UInt16(tsData[offset + 1] & 0x1F) << 8) | UInt16(tsData[offset + 2])
                 let flags = tsData[offset + 3]
+                let payloadUnitStart = (flags & 0x40) != 0
                 let hasPayload = (flags & 0x10) != 0
                 let hasAdaptation = (flags & 0x20) != 0
                 var payloadStart = offset + 4
@@ -25,34 +26,41 @@ class TSToMP4Converter {
                     payloadStart += 1 + adaptLen
                 }
                 if hasPayload && payloadStart < offset + 188 {
-                    let payload = tsData[payloadStart..<(offset + 188)]
-                    packets.append((pid, Data(payload)))
+                    var payload = Data(tsData[payloadStart..<(offset + 188)])
+                    // 如果是payload单元起始，第一个字节是pointer_field，需要跳过
+                    if payloadUnitStart && !payload.isEmpty {
+                        let pointerField = Int(payload[0])
+                        if pointerField + 1 < payload.count {
+                            payload = payload[(pointerField + 1)...]
+                        } else {
+                            payload = Data()
+                        }
+                    }
+                    if pidPayloads[pid] == nil {
+                        pidPayloads[pid] = Data()
+                    }
+                    pidPayloads[pid]!.append(payload)
                 }
             }
             offset += 188
         }
         
-        guard !packets.isEmpty else {
+        guard !pidPayloads.isEmpty else {
             throw NSError(domain: "TSToMP4", code: 2, userInfo: [NSLocalizedDescriptionKey: "未找到TS包"])
         }
         
-        // 2. 解析PAT获取PMT PID
+        // 2. 解析PAT获取PMT PID（PAT PID=0）
         var pmtPID: UInt16 = 0
-        for packet in packets {
-            if packet.pid == 0 {
-                let d = packet.payload
-                if d.count >= 5 {
-                    var idx = 5 // 跳过table_id等
-                    while idx + 4 <= d.count {
-                        let progNum = (UInt16(d[idx]) << 8) | UInt16(d[idx + 1])
-                        if progNum != 0 {
-                            pmtPID = (UInt16(d[idx + 2] & 0x1F) << 8) | UInt16(d[idx + 3])
-                            break
-                        }
-                        idx += 4
-                    }
+        if let patData = pidPayloads[0], patData.count >= 8 {
+            // PAT表头: table_id(1) + section_length(2) + ts_id(2) + version(1) + sec_num(1) + last_sec_num(1) = 8
+            var idx = 8
+            while idx + 4 <= patData.count {
+                let progNum = (UInt16(patData[idx]) << 8) | UInt16(patData[idx + 1])
+                if progNum != 0 {
+                    pmtPID = (UInt16(patData[idx + 2] & 0x1F) << 8) | UInt16(patData[idx + 3])
+                    break
                 }
-                break
+                idx += 4
             }
         }
         
@@ -63,26 +71,21 @@ class TSToMP4Converter {
         // 3. 解析PMT获取视频/音频PID
         var videoPID: UInt16 = 0
         var audioPID: UInt16 = 0
-        for packet in packets {
-            if packet.pid == pmtPID {
-                let d = packet.payload
-                if d.count >= 12 {
-                    let progInfoLen = (Int(d[10] & 0x0F) << 8) | Int(d[11])
-                    var idx = 12 + progInfoLen
-                    while idx + 5 <= d.count {
-                        let streamType = d[idx]
-                        let elemPID = (UInt16(d[idx + 1] & 0x1F) << 8) | UInt16(d[idx + 2])
-                        let esInfoLen = (Int(d[idx + 3] & 0x0F) << 8) | Int(d[idx + 4])
-                        if streamType == 0x1B && videoPID == 0 { // H.264
-                            videoPID = elemPID
-                        }
-                        if (streamType == 0x0F || streamType == 0x11) && audioPID == 0 { // AAC
-                            audioPID = elemPID
-                        }
-                        idx += 5 + esInfoLen
-                    }
+        if let pmtData = pidPayloads[pmtPID], pmtData.count >= 12 {
+            // PMT表头: table_id(1) + section_length(2) + prog_num(2) + version(1) + sec_num(1) + last_sec_num(1) + PCR_PID(2) + prog_info_length(2) = 12
+            let progInfoLen = (Int(pmtData[10] & 0x0F) << 8) | Int(pmtData[11])
+            var idx = 12 + progInfoLen
+            while idx + 5 <= pmtData.count {
+                let streamType = pmtData[idx]
+                let elemPID = (UInt16(pmtData[idx + 1] & 0x1F) << 8) | UInt16(pmtData[idx + 2])
+                let esInfoLen = (Int(pmtData[idx + 3] & 0x0F) << 8) | Int(pmtData[idx + 4])
+                if streamType == 0x1B && videoPID == 0 { // H.264
+                    videoPID = elemPID
                 }
-                break
+                if (streamType == 0x0F || streamType == 0x11) && audioPID == 0 { // AAC
+                    audioPID = elemPID
+                }
+                idx += 5 + esInfoLen
             }
         }
         
@@ -91,15 +94,8 @@ class TSToMP4Converter {
         }
         
         // 4. 收集视频和音频PES数据
-        var videoPESData = Data()
-        var audioPESData = Data()
-        for packet in packets {
-            if packet.pid == videoPID {
-                videoPESData.append(packet.payload)
-            } else if packet.pid == audioPID && audioPID != 0 {
-                audioPESData.append(packet.payload)
-            }
-        }
+        let videoPESData = pidPayloads[videoPID] ?? Data()
+        let audioPESData = (audioPID != 0) ? (pidPayloads[audioPID] ?? Data()) : Data()
         
         // 5. 解析视频PES，提取H.264 NAL单元
         let h264Data = extractPESPayload(videoPESData)
