@@ -209,7 +209,11 @@ class TSToMP4Converter {
         if let audioInput = audioInput, !aacSamples.isEmpty {
             audioGroup.enter()
             var audioTime = CMTime.zero
-            let audioFormatDesc = createAudioFormatDescription()
+            guard let audioFormatDesc = createAudioFormatDescription() else {
+                audioInput.markAsFinished()
+                audioGroup.leave()
+                return
+            }
             
             audioInput.requestMediaDataWhenReady(on: DispatchQueue(label: "audio_write")) {
                 while audioInput.isReadyForMoreMediaData && !aacSamples.isEmpty {
@@ -327,20 +331,23 @@ class TSToMP4Converter {
     }
     
     private static func createVideoFormatDescription(sps: Data, pps: Data) -> CMFormatDescription? {
-        let parameterSet = [sps, pps]
         var formatDesc: CMFormatDescription?
-        let status = parameterSet.withUnsafeBufferPointer { ptr -> OSStatus in
-            var formatDescOut: CMFormatDescription?
-            let result = CMVideoFormatDescriptionCreateFromH264ParameterSets(
-                allocator: kCFAllocatorDefault,
-                parameterSetCount: 2,
-                parameterSetPointers: ptr.map { $0.baseAddress! },
-                parameterSetSizes: ptr.map { $0.count },
-                nalUnitHeaderLength: 4,
-                formatDescriptionOut: &formatDescOut
-            )
-            formatDesc = formatDescOut
-            return result
+        let status = sps.withUnsafeBytes { spsPtr -> OSStatus in
+            pps.withUnsafeBytes { ppsPtr -> OSStatus in
+                let pointers = [spsPtr.baseAddress!, ppsPtr.baseAddress!]
+                let sizes = [sps.count, pps.count]
+                var formatDescOut: CMFormatDescription?
+                let result = CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                    allocator: kCFAllocatorDefault,
+                    parameterSetCount: 2,
+                    parameterSetPointers: pointers,
+                    parameterSetSizes: sizes,
+                    nalUnitHeaderLength: 4,
+                    formatDescriptionOut: &formatDescOut
+                )
+                formatDesc = formatDescOut
+                return result
+            }
         }
         return status == noErr ? formatDesc : nil
     }
