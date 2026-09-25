@@ -82,23 +82,21 @@ class M3U8Manager {
                     try segData.write(to: segFile)
                 }
 
-                // 6. 合并分片
-                self.updateProgress(0.85, message: "合并分片...")
-                let mergedTS = workDir.appendingPathComponent("merged.ts")
-                FileManager.default.createFile(atPath: mergedTS.path, contents: nil)
-                let mergeHandle = try FileHandle(forWritingTo: mergedTS)
+                // 6. 创建本地m3u8播放列表（HLS源，iOS原生支持）
+                self.updateProgress(0.85, message: "创建播放列表...")
+                let m3u8URL = workDir.appendingPathComponent("local.m3u8")
+                var m3u8Content = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n#EXT-X-MEDIA-SEQUENCE:0\n"
                 for i in 0..<total {
-                    let segFile = workDir.appendingPathComponent(String(format: "seg_%05d.ts", i))
-                    let segData = try Data(contentsOf: segFile)
-                    mergeHandle.write(segData)
+                    m3u8Content += "#EXTINF:10.0,\nseg_\(String(format: "%05d", i)).ts\n"
                 }
-                try mergeHandle.close()
+                m3u8Content += "#EXT-X-ENDLIST\n"
+                try m3u8Content.write(to: m3u8URL, atomically: true, encoding: .utf8)
 
                 // 7. 转封装为MP4
                 self.updateProgress(0.9, message: "生成MP4...")
                 let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent("video_\(Int(Date().timeIntervalSince1970)).mp4")
 
-                try self.convertTStoMP4(input: mergedTS, output: outputURL)
+                try self.convertM3U8toMP4(input: m3u8URL, output: outputURL)
 
                 self.updateProgress(1.0, message: "完成!")
                 Thread.sleep(forTimeInterval: 0.3)
@@ -234,8 +232,8 @@ class M3U8Manager {
         return buffer.prefix(numBytesDecrypted)
     }
 
-    // MARK: - TS转MP4（AVAssetReader+Writer手动转码）
-    private func convertTStoMP4(input: URL, output: URL) throws {
+    // MARK: - m3u8转MP4（HLS源+AVAssetReader/Writer）
+    private func convertM3U8toMP4(input: URL, output: URL) throws {
         let asset = AVURLAsset(url: input)
         
         // 等待track加载
@@ -246,8 +244,10 @@ class M3U8Manager {
         let videoTracks = asset.tracks(withMediaType: .video)
         let audioTracks = asset.tracks(withMediaType: .audio)
         
+        print("视频轨: \(videoTracks.count), 音频轨: \(audioTracks.count)")
+        
         guard !videoTracks.isEmpty else {
-            throw NSError(domain: "DonkeyYY", code: 10, userInfo: [NSLocalizedDescriptionKey: "无视频轨"])
+            throw NSError(domain: "DonkeyYY", code: 10, userInfo: [NSLocalizedDescriptionKey: "无视频轨(HLS解析失败)"])
         }
         
         if FileManager.default.fileExists(atPath: output.path) {
@@ -258,7 +258,7 @@ class M3U8Manager {
             throw NSError(domain: "DonkeyYY", code: 11, userInfo: [NSLocalizedDescriptionKey: "无法创建写入器"])
         }
         
-        // 视频写入配置
+        // 视频
         let videoTrack = videoTracks[0]
         let videoSize = videoTrack.naturalSize
         let videoSettings: [String: Any] = [
@@ -266,12 +266,12 @@ class M3U8Manager {
             AVVideoWidthKey: videoSize.width,
             AVVideoHeightKey: videoSize.height
         ]
-        let videoWriterInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
-        videoWriterInput.expectsMediaDataInRealTime = false
-        if writer.canAdd(videoWriterInput) { writer.add(videoWriterInput) }
+        let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+        videoInput.expectsMediaDataInRealTime = false
+        if writer.canAdd(videoInput) { writer.add(videoInput) }
         
-        // 音频写入配置
-        var audioWriterInput: AVAssetWriterInput? = nil
+        // 音频
+        var audioInput: AVAssetWriterInput? = nil
         if !audioTracks.isEmpty {
             let audioSettings: [String: Any] = [
                 AVFormatIDKey: kAudioFormatMPEG4AAC,
@@ -279,25 +279,25 @@ class M3U8Manager {
                 AVSampleRateKey: 44100,
                 AVEncoderBitRateKey: 128000
             ]
-            audioWriterInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
-            audioWriterInput?.expectsMediaDataInRealTime = false
-            if let a = audioWriterInput, writer.canAdd(a) { writer.add(a) }
+            audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+            audioInput?.expectsMediaDataInRealTime = false
+            if let a = audioInput, writer.canAdd(a) { writer.add(a) }
         }
         
-        // 创建读取器
+        // 读取器
         guard let reader = try? AVAssetReader(asset: asset) else {
             throw NSError(domain: "DonkeyYY", code: 12, userInfo: [NSLocalizedDescriptionKey: "无法创建读取器"])
         }
         
-        let videoReaderOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: [
+        let videoReader = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
         ])
-        if reader.canAdd(videoReaderOutput) { reader.add(videoReaderOutput) }
+        if reader.canAdd(videoReader) { reader.add(videoReader) }
         
-        var audioReaderOutput: AVAssetReaderTrackOutput? = nil
+        var audioReader: AVAssetReaderTrackOutput? = nil
         if !audioTracks.isEmpty {
-            audioReaderOutput = AVAssetReaderTrackOutput(track: audioTracks[0], outputSettings: nil)
-            if let a = audioReaderOutput, reader.canAdd(a) { reader.add(a) }
+            audioReader = AVAssetReaderTrackOutput(track: audioTracks[0], outputSettings: nil)
+            if let a = audioReader, reader.canAdd(a) { reader.add(a) }
         }
         
         writer.startWriting()
@@ -307,29 +307,27 @@ class M3U8Manager {
         let group = DispatchGroup()
         var transcodeError: Error? = nil
         
-        // 视频转码
         group.enter()
-        videoWriterInput.requestMediaDataWhenReady(on: DispatchQueue(label: "video_transcode")) {
-            while videoWriterInput.isReadyForMoreMediaData {
-                if let sample = videoReaderOutput.copyNextSampleBuffer() {
-                    videoWriterInput.append(sample)
+        videoInput.requestMediaDataWhenReady(on: DispatchQueue(label: "vt")) {
+            while videoInput.isReadyForMoreMediaData {
+                if let s = videoReader.copyNextSampleBuffer() {
+                    videoInput.append(s)
                 } else {
-                    videoWriterInput.markAsFinished()
+                    videoInput.markAsFinished()
                     group.leave()
                     break
                 }
             }
         }
         
-        // 音频转码
-        if let audioWriterInput = audioWriterInput, let audioReaderOutput = audioReaderOutput {
+        if let audioInput = audioInput, let audioReader = audioReader {
             group.enter()
-            audioWriterInput.requestMediaDataWhenReady(on: DispatchQueue(label: "audio_transcode")) {
-                while audioWriterInput.isReadyForMoreMediaData {
-                    if let sample = audioReaderOutput.copyNextSampleBuffer() {
-                        audioWriterInput.append(sample)
+            audioInput.requestMediaDataWhenReady(on: DispatchQueue(label: "at")) {
+                while audioInput.isReadyForMoreMediaData {
+                    if let s = audioReader.copyNextSampleBuffer() {
+                        audioInput.append(s)
                     } else {
-                        audioWriterInput.markAsFinished()
+                        audioInput.markAsFinished()
                         group.leave()
                         break
                     }
@@ -339,22 +337,16 @@ class M3U8Manager {
         
         group.wait()
         
-        if reader.status != .completed {
-            transcodeError = reader.error
-        }
+        if reader.status != .completed { transcodeError = reader.error }
         
         let finishSem = DispatchSemaphore(value: 0)
         writer.finishWriting {
-            if writer.status != .completed {
-                transcodeError = writer.error
-            }
+            if writer.status != .completed { transcodeError = writer.error }
             finishSem.signal()
         }
         finishSem.wait()
         
-        if let error = transcodeError {
-            throw error
-        }
+        if let e = transcodeError { throw e }
         if writer.status != .completed {
             throw NSError(domain: "DonkeyYY", code: 13, userInfo: [NSLocalizedDescriptionKey: "写入失败"])
         }
