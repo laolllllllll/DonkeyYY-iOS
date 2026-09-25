@@ -31,7 +31,7 @@ class M3U8Manager {
                 print("m3u8 content: \(m3u8Content.prefix(500))")
 
                 // 2. 解析m3u8
-                let (segments, keyURL, iv) = try self.parseM3U8(content: m3u8Content)
+                let (segments, keyURL, iv, hasExplicitIV) = try self.parseM3U8(content: m3u8Content)
                 print("Segments: \(segments.count), keyURL: \(keyURL ?? "none"), iv: \(iv)")
 
                 if segments.isEmpty {
@@ -63,15 +63,25 @@ class M3U8Manager {
                         throw NSError(domain: "DonkeyYY", code: 3, userInfo: [NSLocalizedDescriptionKey: "分片下载失败: \(segName)"])
                     }
 
-                    // AES-128解密
+                    // AES-128解密（HLS规范：无显式IV时用分片序列号作为IV，大端32位前补0）
                     if let key = key, key.count == 16 {
+                        let segIV: Data
+                        if hasExplicitIV {
+                            segIV = self.hexToData(iv)
+                        } else {
+                            var ivData = Data(count: 16)
+                            ivData[12] = UInt8((index >> 24) & 0xFF)
+                            ivData[13] = UInt8((index >> 16) & 0xFF)
+                            ivData[14] = UInt8((index >> 8) & 0xFF)
+                            ivData[15] = UInt8(index & 0xFF)
+                            segIV = ivData
+                        }
                         do {
-                            segData = try self.aesDecrypt(data: segData, key: key, iv: self.hexToData(iv))
+                            segData = try self.aesDecrypt(data: segData, key: key, iv: segIV)
                         } catch {
                             print("Decrypt fail seg \(index): \(error)")
-                            // 尝试NoPadding
                             do {
-                                segData = try self.aesDecryptNoPadding(data: segData, key: key, iv: self.hexToData(iv))
+                                segData = try self.aesDecryptNoPadding(data: segData, key: key, iv: segIV)
                             } catch {
                                 print("Decrypt NoPadding also fail: \(error)")
                             }
@@ -82,21 +92,23 @@ class M3U8Manager {
                     try segData.write(to: segFile)
                 }
 
-                // 6. 创建本地m3u8播放列表（HLS源，iOS原生支持）
-                self.updateProgress(0.85, message: "创建播放列表...")
-                let m3u8URL = workDir.appendingPathComponent("local.m3u8")
-                var localM3U8 = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n#EXT-X-MEDIA-SEQUENCE:0\n"
+                // 6. 合并分片为单个TS
+                self.updateProgress(0.85, message: "合并分片...")
+                let mergedTS = workDir.appendingPathComponent("merged.ts")
+                FileManager.default.createFile(atPath: mergedTS.path, contents: nil)
+                let mergeHandle = try FileHandle(forWritingTo: mergedTS)
                 for i in 0..<total {
-                    localM3U8 += "#EXTINF:10.0,\nseg_\(String(format: "%05d", i)).ts\n"
+                    let segFile = workDir.appendingPathComponent(String(format: "seg_%05d.ts", i))
+                    let segData = try Data(contentsOf: segFile)
+                    mergeHandle.write(segData)
                 }
-                localM3U8 += "#EXT-X-ENDLIST\n"
-                try localM3U8.write(to: m3u8URL, atomically: true, encoding: .utf8)
+                try mergeHandle.close()
 
                 // 7. 转封装为MP4
                 self.updateProgress(0.9, message: "生成MP4...")
                 let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent("video_\(Int(Date().timeIntervalSince1970)).mp4")
 
-                try self.convertM3U8toMP4(input: m3u8URL, output: outputURL)
+                try self.convertTStoMP4(input: mergedTS, output: outputURL)
 
                 self.updateProgress(1.0, message: "完成!")
                 Thread.sleep(forTimeInterval: 0.3)
@@ -128,10 +140,11 @@ class M3U8Manager {
     }
 
     // MARK: - 解析m3u8
-    private func parseM3U8(content: String) throws -> (segments: [String], keyURL: String?, iv: String) {
+    private func parseM3U8(content: String) throws -> (segments: [String], keyURL: String?, iv: String, hasExplicitIV: Bool) {
         var segments: [String] = []
         var keyURL: String? = nil
         var iv = "00000000000000000000000000000000"
+        var hasExplicitIV = false
 
         let lines = content.components(separatedBy: "\n")
         for line in lines {
@@ -151,6 +164,7 @@ class M3U8Manager {
                     let hexChars = ivStr.prefix(while: { $0.isHexDigit })
                     if !hexChars.isEmpty {
                         iv = String(hexChars)
+                        hasExplicitIV = true
                     }
                 }
             } else if !trimmed.hasPrefix("#") && trimmed.hasSuffix(".ts") {
@@ -158,7 +172,7 @@ class M3U8Manager {
             }
         }
 
-        return (segments, keyURL, iv)
+        return (segments, keyURL, iv, hasExplicitIV)
     }
 
     // MARK: - AES解密
@@ -232,8 +246,8 @@ class M3U8Manager {
         return buffer.prefix(numBytesDecrypted)
     }
 
-    // MARK: - m3u8转MP4（HLS源+AVAssetReader/Writer）
-    private func convertM3U8toMP4(input: URL, output: URL) throws {
+    // MARK: - TS转MP4（AVAssetReader+Writer）
+    private func convertTStoMP4(input: URL, output: URL) throws {
         let asset = AVURLAsset(url: input)
         
         // 等待track加载
@@ -247,7 +261,7 @@ class M3U8Manager {
         print("视频轨: \(videoTracks.count), 音频轨: \(audioTracks.count)")
         
         guard !videoTracks.isEmpty else {
-            throw NSError(domain: "DonkeyYY", code: 10, userInfo: [NSLocalizedDescriptionKey: "无视频轨(HLS解析失败)"])
+            throw NSError(domain: "DonkeyYY", code: 10, userInfo: [NSLocalizedDescriptionKey: "无视频轨"])
         }
         
         if FileManager.default.fileExists(atPath: output.path) {
