@@ -1,6 +1,8 @@
 import UIKit
 import WebKit
 import Photos
+import AVKit
+import AVFoundation
 
 class ViewController: UIViewController, WKNavigationDelegate {
 
@@ -214,25 +216,30 @@ class ViewController: UIViewController, WKNavigationDelegate {
 
         print("Final m3u8 URL: \(realURL)")
 
-        showDownloadDialog(m3u8URL: realURL)
+        showPlayDialog(m3u8URL: realURL)
     }
 
-    func showDownloadDialog(m3u8URL: String) {
-        let alert = UIAlertController(title: "找到m3u8文件", message: "是否下载并转换为MP4？\n\n\(m3u8URL)", preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: "是", style: .default) { _ in
-            M3U8Manager.shared.downloadAndConvert(m3u8URL: m3u8URL, from: self) { [weak self] result in
-                DispatchQueue.main.async {
-                    switch result {
-                    case .success(let videoURL):
-                        self?.showSaveDialog(videoURL: videoURL)
-                    case .failure(let error):
-                        self?.showError(error: error)
-                    }
-                }
-            }
+    func showPlayDialog(m3u8URL: String) {
+        let alert = UIAlertController(title: "找到视频", message: "是否全屏播放？", preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "播放", style: .default) { [weak self] _ in
+            self?.playVideo(m3u8URL: m3u8URL)
         })
-        alert.addAction(UIAlertAction(title: "否", style: .cancel))
+        alert.addAction(UIAlertAction(title: "取消", style: .cancel))
         present(alert, animated: true)
+    }
+    
+    func playVideo(m3u8URL: String) {
+        guard let url = URL(string: m3u8URL) else {
+            showError(error: NSError(domain: "DonkeyYY", code: 1, userInfo: [NSLocalizedDescriptionKey: "视频地址无效"]))
+            return
+        }
+        let player = AVPlayer(url: url)
+        let playerVC = AVPlayerViewController()
+        playerVC.player = player
+        playerVC.modalPresentationStyle = .fullScreen
+        present(playerVC, animated: true) {
+            player.play()
+        }
     }
 
     func showSaveDialog(videoURL: URL) {
