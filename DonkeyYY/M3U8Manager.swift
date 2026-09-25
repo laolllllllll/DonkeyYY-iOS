@@ -19,7 +19,7 @@ class LocalHLSServer {
         guard listenSocket >= 0 else { return nil }
         var yes: Int32 = 1
         setsockopt(listenSocket, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout.size(ofValue: yes)))
-        var addr = sockaddr_in(sin_len: UInt8(MemoryLayout<sockaddr_in>.size), sin_family: sa_family_t(AF_INET), sin_port: 0, sin_addr: in_addr(s_addr: inet_addr("127.0.0.1")), sin_zero: (0,0,0,0,0,0,0,0))
+        var addr = sockaddr_in(sin_len: UInt8(MemoryLayout<sockaddr_in>.size), sin_family: sa_family_t(AF_INET), sin_port: UInt16(0), sin_addr: in_addr(s_addr: inet_addr("127.0.0.1")), sin_zero: (Int8(0),Int8(0),Int8(0),Int8(0),Int8(0),Int8(0),Int8(0),Int8(0)))
         let bindOK = withUnsafePointer(to: &addr) { ptr -> Int32 in
             ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                 bind(self.listenSocket, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
@@ -28,7 +28,7 @@ class LocalHLSServer {
         guard bindOK == 0 else { return nil }
         listen(listenSocket, 10)
         var addrLen = socklen_t(MemoryLayout<sockaddr_in>.size)
-        var actualAddr = sockaddr_in(sin_len: 0, sin_family: 0, sin_port: 0, sin_addr: in_addr(s_addr: 0), sin_zero: (0,0,0,0,0,0,0,0))
+        var actualAddr = sockaddr_in(sin_len: UInt8(0), sin_family: sa_family_t(0), sin_port: UInt16(0), sin_addr: in_addr(s_addr: in_addr_t(0)), sin_zero: (Int8(0),Int8(0),Int8(0),Int8(0),Int8(0),Int8(0),Int8(0),Int8(0)))
         getsockname(listenSocket, UnsafeMutablePointer(&actualAddr), &addrLen)
         port = actualAddr.sin_port.bigEndian
         isRunning = true
