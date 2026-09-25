@@ -1,5 +1,6 @@
 import UIKit
 import WebKit
+import Photos
 
 class ViewController: UIViewController, WKNavigationDelegate {
 
@@ -47,12 +48,18 @@ class ViewController: UIViewController, WKNavigationDelegate {
     func setupFloatButton() {
         floatButton = UIButton(type: .custom)
         floatButton.frame = CGRect(x: 20, y: 200, width: 56, height: 56)
-        floatButton.backgroundColor = UIColor(red: 0.9, green: 0.3, blue: 0.3, alpha: 0.9)
+        floatButton.backgroundColor = UIColor.white
         floatButton.layer.cornerRadius = 28
         floatButton.clipsToBounds = true
-        floatButton.setTitle("驴", for: .normal)
-        floatButton.titleLabel?.font = UIFont.boldSystemFont(ofSize: 24)
-        floatButton.setTitleColor(.white, for: .normal)
+        if let logoImage = UIImage(named: "logo") {
+            floatButton.setImage(logoImage, for: .normal)
+            floatButton.imageView?.contentMode = .scaleAspectFit
+        } else {
+            floatButton.setTitle("驴", for: .normal)
+            floatButton.titleLabel?.font = UIFont.boldSystemFont(ofSize: 24)
+            floatButton.setTitleColor(.white, for: .normal)
+            floatButton.backgroundColor = UIColor(red: 0.9, green: 0.3, blue: 0.3, alpha: 0.9)
+        }
         floatButton.layer.shadowColor = UIColor.black.cgColor
         floatButton.layer.shadowOpacity = 0.5
         floatButton.layer.shadowOffset = CGSize(width: 2, height: 2)
@@ -241,14 +248,40 @@ class ViewController: UIViewController, WKNavigationDelegate {
     }
 
     func saveToGallery(videoURL: URL) {
-        UISaveVideoAtPathToSavedPhotosAlbum(videoURL.path, self, #selector(videoSaved(_:didFinishSavingWithError:contextInfo:)), nil)
+        let status = PHPhotoLibrary.authorizationStatus(for: .addOnly)
+        switch status {
+        case .authorized, .limited:
+            self.performSaveVideo(videoURL: videoURL)
+        case .notDetermined:
+            PHPhotoLibrary.requestAuthorization(for: .addOnly) { [weak self] newStatus in
+                DispatchQueue.main.async {
+                    if newStatus == .authorized || newStatus == .limited {
+                        self?.performSaveVideo(videoURL: videoURL)
+                    } else {
+                        self?.showToast("保存失败：未获得相册权限")
+                    }
+                }
+            }
+        case .denied, .restricted:
+            showToast("保存失败：请在设置中开启相册权限")
+        @unknown default:
+            showToast("保存失败：未知权限状态")
+        }
     }
 
-    @objc func videoSaved(_ videoPath: String, didFinishSavingWithError error: Error?, contextInfo: UnsafeRawPointer) {
-        if let error = error {
-            showToast("保存失败: \(error.localizedDescription)")
-        } else {
-            showToast("已保存到相册")
+    func performSaveVideo(videoURL: URL) {
+        PHPhotoLibrary.shared().performChanges({
+            PHAssetCreationRequest.creationRequestForAssetFromVideo(atFileURL: videoURL)
+        }) { [weak self] success, error in
+            DispatchQueue.main.async {
+                if success {
+                    self?.showToast("已保存到相册")
+                } else if let error = error {
+                    self?.showToast("保存失败: \(error.localizedDescription)")
+                } else {
+                    self?.showToast("保存失败")
+                }
+            }
         }
     }
 

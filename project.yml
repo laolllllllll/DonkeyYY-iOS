@@ -30,6 +30,7 @@ targets:
           - "Assets.xcassets"
     resources:
       - path: DonkeyYY/Assets.xcassets
+      - path: DonkeyYY/logo.png
     info:
       path: DonkeyYY/Info.plist
       properties:
