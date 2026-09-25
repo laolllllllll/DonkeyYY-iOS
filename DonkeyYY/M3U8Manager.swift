@@ -3,9 +3,11 @@ import AVFoundation
 import CommonCrypto
 
 
-// MARK: - 简单本地HTTP服务器（用于提供HLS流）
+import Network
+
+// MARK: - 本地HTTP服务器（NWListener）
 class LocalHLSServer {
-    private var listenSocket: Int32 = -1
+    private var listener: NWListener?
     private(set) var port: UInt16 = 0
     private let baseURL: URL
     private var isRunning = false
@@ -15,63 +17,76 @@ class LocalHLSServer {
     }
     
     func start() -> UInt16? {
-        listenSocket = socket(AF_INET, SOCK_STREAM, 0)
-        guard listenSocket >= 0 else { return nil }
-        var yes: Int32 = 1
-        setsockopt(listenSocket, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout.size(ofValue: yes)))
-        var addr = sockaddr_in(sin_len: UInt8(MemoryLayout<sockaddr_in>.size), sin_family: sa_family_t(AF_INET), sin_port: UInt16(0), sin_addr: in_addr(s_addr: inet_addr("127.0.0.1")), sin_zero: (Int8(0),Int8(0),Int8(0),Int8(0),Int8(0),Int8(0),Int8(0),Int8(0)))
-        let bindOK = withUnsafePointer(to: &addr) { ptr -> Int32 in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(self.listenSocket, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+        let params = NWParameters.tcp
+        params.allowLocalEndpointReuse = true
+        guard let listener = try? NWListener(using: params, on: NWEndpoint.Port(rawValue: 0)!) else { return nil }
+        self.listener = listener
+        
+        listener.newConnectionHandler = { [weak self] connection in
+            self?.handleConnection(connection)
+        }
+        
+        let sem = DispatchSemaphore(value: 0)
+        listener.stateUpdateHandler = { state in
+            if case .ready = state { sem.signal() }
+            if case .failed = state { sem.signal() }
+        }
+        listener.start(queue: .global())
+        sem.wait()
+        
+        guard case .ready = listener.state else { return nil }
+        if let p = listener.port {
+            self.port = UInt16(p.rawValue)
+        }
+        isRunning = true
+        return self.port
+    }
+    
+    private func handleConnection(_ connection: NWConnection) {
+        connection.start(queue: .global())
+        var received = Data()
+        let headerEnd = Data([0x0D, 0x0A, 0x0D, 0x0A])
+        func readMore() {
+            connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
+                if let data = data { received.append(data) }
+                if received.range(of: headerEnd) != nil || isComplete || error != nil {
+                    self?.sendResponse(connection, requestData: received)
+                } else {
+                    readMore()
+                }
             }
         }
-        guard bindOK == 0 else { return nil }
-        listen(listenSocket, 10)
-        var addrLen = socklen_t(MemoryLayout<sockaddr_in>.size)
-        var actualAddr = sockaddr_in(sin_len: UInt8(0), sin_family: sa_family_t(0), sin_port: UInt16(0), sin_addr: in_addr(s_addr: in_addr_t(0)), sin_zero: (Int8(0),Int8(0),Int8(0),Int8(0),Int8(0),Int8(0),Int8(0),Int8(0)))
-        getsockname(listenSocket, UnsafeMutablePointer(&actualAddr), &addrLen)
-        port = actualAddr.sin_port.bigEndian
-        isRunning = true
-        DispatchQueue.global(qos: .background).async { self.acceptLoop() }
-        return port
+        readMore()
     }
     
-    private func acceptLoop() {
-        while isRunning {
-            let client = accept(listenSocket, nil, nil)
-            guard client >= 0 else { continue }
-            DispatchQueue.global(qos: .userInitiated).async { self.handle(client) }
+    private func sendResponse(_ connection: NWConnection, requestData: Data) {
+        guard let reqStr = String(data: requestData, encoding: .utf8),
+              let pathStart = reqStr.firstIndex(of: " "),
+              let pathEnd = reqStr[pathStart...].firstIndex(of: " ") else {
+            connection.cancel()
+            return
         }
-    }
-    
-    private func handle(_ socket: Int32) {
-        var req = ""
-        var buf = [UInt8](repeating: 0, count: 8192)
-        while true {
-            let n = recv(socket, &buf, buf.count, 0)
-            if n <= 0 { break }
-            req += String(bytes: buf[..<n], encoding: .utf8) ?? ""
-            if req.contains("\r\n\r\n") { break }
-        }
-        let parts = req.components(separatedBy: " ")
-        guard parts.count >= 2 else { close(socket); return }
-        var path = parts[1].removingPercentEncoding ?? parts[1]
+        var path = String(reqStr[reqStr.index(after: pathStart)..<pathEnd]).removingPercentEncoding ?? ""
         if path.hasPrefix("/") { path.removeFirst() }
         let fileURL = baseURL.appendingPathComponent(path)
+        
         guard let data = try? Data(contentsOf: fileURL) else {
-            let r = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
-            send(socket, r, r.utf8.count, 0); close(socket); return
+            let body = "404 Not Found"
+            let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n\(body)"
+            connection.send(content: resp.data(using: .utf8), completion: .contentProcessed { _ in connection.cancel() })
+            return
         }
         let ct = path.hasSuffix(".m3u8") ? "application/vnd.apple.mpegurl" : "video/mp2t"
-        let h = "HTTP/1.1 200 OK\r\nContent-Type: \(ct)\r\nContent-Length: \(data.count)\r\nConnection: close\r\n\r\n"
-        send(socket, h, h.utf8.count, 0)
-        data.withUnsafeBytes { send(socket, $0.baseAddress, data.count, 0) }
-        close(socket)
+        let header = "HTTP/1.1 200 OK\r\nContent-Type: \(ct)\r\nContent-Length: \(data.count)\r\nConnection: close\r\n\r\n"
+        var response = Data(header.utf8)
+        response.append(data)
+        connection.send(content: response, completion: .contentProcessed { _ in connection.cancel() })
     }
     
     func stop() {
         isRunning = false
-        if listenSocket >= 0 { close(listenSocket); listenSocket = -1 }
+        listener?.cancel()
+        listener = nil
     }
 }
 
