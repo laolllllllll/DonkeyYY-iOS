@@ -2,6 +2,82 @@ import UIKit
 import AVFoundation
 import CommonCrypto
 
+
+// MARK: - 简单本地HTTP服务器（用于提供HLS流）
+class LocalHLSServer {
+    private var listenSocket: Int32 = -1
+    private(set) var port: UInt16 = 0
+    private let baseURL: URL
+    private var isRunning = false
+    
+    init(baseURL: URL) {
+        self.baseURL = baseURL
+    }
+    
+    func start() -> UInt16? {
+        listenSocket = socket(AF_INET, SOCK_STREAM, 0)
+        guard listenSocket >= 0 else { return nil }
+        var yes: Int32 = 1
+        setsockopt(listenSocket, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout.size(ofValue: yes)))
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = 0
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let bindOK = withUnsafePointer(to: &addr) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(self.listenSocket, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bindOK == 0 else { return nil }
+        listen(listenSocket, 10)
+        var addrLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+        var actualAddr = sockaddr_in()
+        getsockname(listenSocket, UnsafeMutablePointer(&actualAddr), &addrLen)
+        port = actualAddr.sin_port.bigEndian
+        isRunning = true
+        DispatchQueue.global(qos: .background).async { self.acceptLoop() }
+        return port
+    }
+    
+    private func acceptLoop() {
+        while isRunning {
+            let client = accept(listenSocket, nil, nil)
+            guard client >= 0 else { continue }
+            DispatchQueue.global(qos: .userInitiated).async { self.handle(client) }
+        }
+    }
+    
+    private func handle(_ socket: Int32) {
+        var req = ""
+        var buf = [UInt8](repeating: 0, count: 8192)
+        while true {
+            let n = recv(socket, &buf, buf.count, 0)
+            if n <= 0 { break }
+            req += String(bytes: buf[..<n], encoding: .utf8) ?? ""
+            if req.contains("\r\n\r\n") { break }
+        }
+        let parts = req.components(separatedBy: " ")
+        guard parts.count >= 2 else { close(socket); return }
+        var path = parts[1].removingPercentEncoding ?? parts[1]
+        if path.hasPrefix("/") { path.removeFirst() }
+        let fileURL = baseURL.appendingPathComponent(path)
+        guard let data = try? Data(contentsOf: fileURL) else {
+            let r = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+            send(socket, r, r.utf8.count, 0); close(socket); return
+        }
+        let ct = path.hasSuffix(".m3u8") ? "application/vnd.apple.mpegurl" : "video/mp2t"
+        let h = "HTTP/1.1 200 OK\r\nContent-Type: \(ct)\r\nContent-Length: \(data.count)\r\nConnection: close\r\n\r\n"
+        send(socket, h, h.utf8.count, 0)
+        data.withUnsafeBytes { send(socket, $0.baseAddress, data.count, 0) }
+        close(socket)
+    }
+    
+    func stop() {
+        isRunning = false
+        if listenSocket >= 0 { close(listenSocket); listenSocket = -1 }
+    }
+}
+
 class M3U8Manager {
 
     static let shared = M3U8Manager()
@@ -92,23 +168,27 @@ class M3U8Manager {
                     try segData.write(to: segFile)
                 }
 
-                // 6. 合并分片为单个TS
-                self.updateProgress(0.85, message: "合并分片...")
-                let mergedTS = workDir.appendingPathComponent("merged.ts")
-                FileManager.default.createFile(atPath: mergedTS.path, contents: nil)
-                let mergeHandle = try FileHandle(forWritingTo: mergedTS)
+                // 6. 创建本地m3u8播放列表
+                self.updateProgress(0.85, message: "创建播放列表...")
+                let m3u8File = workDir.appendingPathComponent("local.m3u8")
+                var m3u8Str = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n#EXT-X-MEDIA-SEQUENCE:0\n"
                 for i in 0..<total {
-                    let segFile = workDir.appendingPathComponent(String(format: "seg_%05d.ts", i))
-                    let segData = try Data(contentsOf: segFile)
-                    mergeHandle.write(segData)
+                    m3u8Str += "#EXTINF:10.0,\nseg_\(String(format: "%05d", i)).ts\n"
                 }
-                try mergeHandle.close()
+                m3u8Str += "#EXT-X-ENDLIST\n"
+                try m3u8Str.write(to: m3u8File, atomically: true, encoding: .utf8)
 
                 // 7. 转封装为MP4
                 self.updateProgress(0.9, message: "生成MP4...")
-                let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent("video_\(Int(Date().timeIntervalSince1970)).mp4")
-
-                try self.convertTStoMP4(input: mergedTS, output: outputURL)
+                                let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent("video_\(Int(Date().timeIntervalSince1970)).mp4")
+                let server = LocalHLSServer(baseURL: workDir)
+                guard let port = server.start() else {
+                    throw NSError(domain: "DonkeyYY", code: 20, userInfo: [NSLocalizedDescriptionKey: "无法启动本地服务器"])
+                }
+                defer { server.stop() }
+                let hlsURL = URL(string: "http://127.0.0.1:\(port)/local.m3u8")!
+                print("HLS URL: \(hlsURL)")
+                try self.convertHLStoMP4(input: hlsURL, output: outputURL)
 
                 self.updateProgress(1.0, message: "完成!")
                 Thread.sleep(forTimeInterval: 0.3)
@@ -246,8 +326,8 @@ class M3U8Manager {
         return buffer.prefix(numBytesDecrypted)
     }
 
-    // MARK: - TS转MP4（AVAssetReader+Writer）
-    private func convertTStoMP4(input: URL, output: URL) throws {
+    // MARK: - HLS转MP4（本地HTTP服务器+AVAssetReader）
+    private func convertHLStoMP4(input: URL, output: URL) throws {
         let asset = AVURLAsset(url: input)
         
         // 等待track加载
