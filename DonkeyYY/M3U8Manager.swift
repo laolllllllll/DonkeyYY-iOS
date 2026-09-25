@@ -85,12 +85,12 @@ class M3U8Manager {
                 // 6. 创建本地m3u8播放列表（HLS源，iOS原生支持）
                 self.updateProgress(0.85, message: "创建播放列表...")
                 let m3u8URL = workDir.appendingPathComponent("local.m3u8")
-                var m3u8Content = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n#EXT-X-MEDIA-SEQUENCE:0\n"
+                var localM3U8 = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n#EXT-X-MEDIA-SEQUENCE:0\n"
                 for i in 0..<total {
-                    m3u8Content += "#EXTINF:10.0,\nseg_\(String(format: "%05d", i)).ts\n"
+                    localM3U8 += "#EXTINF:10.0,\nseg_\(String(format: "%05d", i)).ts\n"
                 }
-                m3u8Content += "#EXT-X-ENDLIST\n"
-                try m3u8Content.write(to: m3u8URL, atomically: true, encoding: .utf8)
+                localM3U8 += "#EXT-X-ENDLIST\n"
+                try localM3U8.write(to: m3u8URL, atomically: true, encoding: .utf8)
 
                 // 7. 转封装为MP4
                 self.updateProgress(0.9, message: "生成MP4...")
