@@ -234,36 +234,25 @@ class M3U8Manager {
         return buffer.prefix(numBytesDecrypted)
     }
 
-    // MARK: - TS转MP4
+    // MARK: - TS转MP4（真正转码，相册可识别）
     private func convertTStoMP4(input: URL, output: URL) throws {
         let asset = AVURLAsset(url: input)
-
-        guard let exportSession = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetPassthrough) else {
-            // 如果Passthrough失败，直接复制文件（ts文件很多播放器也能播放）
-            print("AVAssetExportSession创建失败，直接复制ts为mp4")
-            try FileManager.default.copyItem(at: input, to: output)
-            return
+        let presets = [AVAssetExportPresetHighestQuality, AVAssetExportPresetMediumQuality, AVAssetExportPreset640x480]
+        var exportSuccess = false
+        for preset in presets {
+            guard let exportSession = AVAssetExportSession(asset: asset, presetName: preset) else { continue }
+            if FileManager.default.fileExists(atPath: output.path) { try? FileManager.default.removeItem(at: output) }
+            exportSession.outputURL = output
+            exportSession.outputFileType = .mp4
+            exportSession.shouldOptimizeForNetworkUse = true
+            let sem = DispatchSemaphore(value: 0)
+            exportSession.exportAsynchronously { sem.signal() }
+            sem.wait()
+            if exportSession.status == .completed { exportSuccess = true; break }
+            print("Preset \(preset) 失败: \(exportSession.error?.localizedDescription ?? "")")
         }
-
-        exportSession.outputURL = output
-        exportSession.outputFileType = .mp4
-        exportSession.shouldOptimizeForNetworkUse = true
-
-        let semaphore = DispatchSemaphore(value: 0)
-        var exportError: Error? = nil
-
-        exportSession.exportAsynchronously {
-            if exportSession.status == .failed {
-                exportError = exportSession.error
-            }
-            semaphore.signal()
-        }
-
-        semaphore.wait()
-
-        if let error = exportError {
-            print("AVAssetExportSession失败: \(error)，直接复制ts为mp4")
-            try FileManager.default.copyItem(at: input, to: output)
+        if !exportSuccess {
+            throw NSError(domain: "DonkeyYY", code: 10, userInfo: [NSLocalizedDescriptionKey: "视频转码失败"])
         }
     }
 
