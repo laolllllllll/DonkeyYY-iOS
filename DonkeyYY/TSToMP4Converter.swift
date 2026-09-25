@@ -334,7 +334,9 @@ class TSToMP4Converter {
         var formatDesc: CMFormatDescription?
         let status = sps.withUnsafeBytes { spsPtr -> OSStatus in
             pps.withUnsafeBytes { ppsPtr -> OSStatus in
-                let pointers = [spsPtr.baseAddress!, ppsPtr.baseAddress!]
+                let spsUInt8 = spsPtr.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                let ppsUInt8 = ppsPtr.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                let pointers = [spsUInt8, ppsUInt8]
                 let sizes = [sps.count, pps.count]
                 var formatDescOut: CMFormatDescription?
                 let result = CMVideoFormatDescriptionCreateFromH264ParameterSets(
