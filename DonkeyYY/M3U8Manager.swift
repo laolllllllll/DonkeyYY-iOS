@@ -3,93 +3,6 @@ import AVFoundation
 import CommonCrypto
 
 
-import Network
-
-// MARK: - 本地HTTP服务器（NWListener）
-class LocalHLSServer {
-    private var listener: NWListener?
-    private(set) var port: UInt16 = 0
-    private let baseURL: URL
-    private var isRunning = false
-    
-    init(baseURL: URL) {
-        self.baseURL = baseURL
-    }
-    
-    func start() -> UInt16? {
-        let params = NWParameters.tcp
-        params.allowLocalEndpointReuse = true
-        guard let listener = try? NWListener(using: params, on: NWEndpoint.Port(rawValue: 0)!) else { return nil }
-        self.listener = listener
-        
-        listener.newConnectionHandler = { [weak self] connection in
-            self?.handleConnection(connection)
-        }
-        
-        let sem = DispatchSemaphore(value: 0)
-        listener.stateUpdateHandler = { state in
-            if case .ready = state { sem.signal() }
-            if case .failed = state { sem.signal() }
-        }
-        listener.start(queue: .global())
-        sem.wait()
-        
-        guard case .ready = listener.state else { return nil }
-        if let p = listener.port {
-            self.port = UInt16(p.rawValue)
-        }
-        isRunning = true
-        return self.port
-    }
-    
-    private func handleConnection(_ connection: NWConnection) {
-        connection.start(queue: .global())
-        var received = Data()
-        let headerEnd = Data([0x0D, 0x0A, 0x0D, 0x0A])
-        func readMore() {
-            connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
-                if let data = data { received.append(data) }
-                if received.range(of: headerEnd) != nil || isComplete || error != nil {
-                    self?.sendResponse(connection, requestData: received)
-                } else {
-                    readMore()
-                }
-            }
-        }
-        readMore()
-    }
-    
-    private func sendResponse(_ connection: NWConnection, requestData: Data) {
-        guard let reqStr = String(data: requestData, encoding: .utf8),
-              let pathStart = reqStr.firstIndex(of: " "),
-              let pathEnd = reqStr[pathStart...].firstIndex(of: " ") else {
-            connection.cancel()
-            return
-        }
-        var path = String(reqStr[reqStr.index(after: pathStart)..<pathEnd]).removingPercentEncoding ?? ""
-        if path.hasPrefix("/") { path.removeFirst() }
-        let fileURL = baseURL.appendingPathComponent(path)
-        
-        guard let data = try? Data(contentsOf: fileURL) else {
-            let body = "404 Not Found"
-            let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n\(body)"
-            connection.send(content: resp.data(using: .utf8), completion: .contentProcessed { _ in connection.cancel() })
-            return
-        }
-        let ct = path.hasSuffix(".m3u8") ? "application/vnd.apple.mpegurl" : "video/mp2t"
-        let header = "HTTP/1.1 200 OK\r\nContent-Type: \(ct)\r\nContent-Length: \(data.count)\r\nConnection: close\r\n\r\n"
-        var response = Data(header.utf8)
-        response.append(data)
-        connection.send(content: response, completion: .contentProcessed { _ in connection.cancel() })
-    }
-    
-    func stop() {
-        isRunning = false
-        listener?.cancel()
-        listener = nil
-    }
-}
-
 class M3U8Manager {
 
     static let shared = M3U8Manager()
@@ -180,27 +93,22 @@ class M3U8Manager {
                     try segData.write(to: segFile)
                 }
 
-                // 6. 创建本地m3u8播放列表
-                self.updateProgress(0.85, message: "创建播放列表...")
-                let m3u8File = workDir.appendingPathComponent("local.m3u8")
-                var m3u8Str = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n#EXT-X-MEDIA-SEQUENCE:0\n"
+                // 6. 合并分片为单个TS
+                self.updateProgress(0.85, message: "合并分片...")
+                let mergedTS = workDir.appendingPathComponent("merged.ts")
+                FileManager.default.createFile(atPath: mergedTS.path, contents: nil)
+                let mergeHandle = try FileHandle(forWritingTo: mergedTS)
                 for i in 0..<total {
-                    m3u8Str += "#EXTINF:10.0,\nseg_\(String(format: "%05d", i)).ts\n"
+                    let segFile = workDir.appendingPathComponent(String(format: "seg_%05d.ts", i))
+                    let segData = try Data(contentsOf: segFile)
+                    mergeHandle.write(segData)
                 }
-                m3u8Str += "#EXT-X-ENDLIST\n"
-                try m3u8Str.write(to: m3u8File, atomically: true, encoding: .utf8)
+                try mergeHandle.close()
 
-                // 7. 转封装为MP4
+                // 7. 手动解析TS重新封装为MP4
                 self.updateProgress(0.9, message: "生成MP4...")
-                                let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent("video_\(Int(Date().timeIntervalSince1970)).mp4")
-                let server = LocalHLSServer(baseURL: workDir)
-                guard let port = server.start() else {
-                    throw NSError(domain: "DonkeyYY", code: 20, userInfo: [NSLocalizedDescriptionKey: "无法启动本地服务器"])
-                }
-                defer { server.stop() }
-                let hlsURL = URL(string: "http://127.0.0.1:\(port)/local.m3u8")!
-                print("HLS URL: \(hlsURL)")
-                try self.convertHLStoMP4(input: hlsURL, output: outputURL)
+                let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent("video_\(Int(Date().timeIntervalSince1970)).mp4")
+                try TSToMP4Converter.convert(tsURL: mergedTS, outputURL: outputURL)
 
                 self.updateProgress(1.0, message: "完成!")
                 Thread.sleep(forTimeInterval: 0.3)
@@ -338,125 +246,7 @@ class M3U8Manager {
         return buffer.prefix(numBytesDecrypted)
     }
 
-    // MARK: - HLS转MP4（本地HTTP服务器+AVAssetReader）
-    private func convertHLStoMP4(input: URL, output: URL) throws {
-        let asset = AVURLAsset(url: input)
-        
-        // 等待track加载
-        let sem = DispatchSemaphore(value: 0)
-        asset.loadValuesAsynchronously(forKeys: ["tracks"]) { sem.signal() }
-        sem.wait()
-        
-        let videoTracks = asset.tracks(withMediaType: .video)
-        let audioTracks = asset.tracks(withMediaType: .audio)
-        
-        print("视频轨: \(videoTracks.count), 音频轨: \(audioTracks.count)")
-        
-        guard !videoTracks.isEmpty else {
-            throw NSError(domain: "DonkeyYY", code: 10, userInfo: [NSLocalizedDescriptionKey: "无视频轨"])
-        }
-        
-        if FileManager.default.fileExists(atPath: output.path) {
-            try? FileManager.default.removeItem(at: output)
-        }
-        
-        guard let writer = try? AVAssetWriter(outputURL: output, fileType: .mp4) else {
-            throw NSError(domain: "DonkeyYY", code: 11, userInfo: [NSLocalizedDescriptionKey: "无法创建写入器"])
-        }
-        
-        // 视频
-        let videoTrack = videoTracks[0]
-        let videoSize = videoTrack.naturalSize
-        let videoSettings: [String: Any] = [
-            AVVideoCodecKey: AVVideoCodecType.h264,
-            AVVideoWidthKey: videoSize.width,
-            AVVideoHeightKey: videoSize.height
-        ]
-        let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
-        videoInput.expectsMediaDataInRealTime = false
-        if writer.canAdd(videoInput) { writer.add(videoInput) }
-        
-        // 音频
-        var audioInput: AVAssetWriterInput? = nil
-        if !audioTracks.isEmpty {
-            let audioSettings: [String: Any] = [
-                AVFormatIDKey: kAudioFormatMPEG4AAC,
-                AVNumberOfChannelsKey: 2,
-                AVSampleRateKey: 44100,
-                AVEncoderBitRateKey: 128000
-            ]
-            audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
-            audioInput?.expectsMediaDataInRealTime = false
-            if let a = audioInput, writer.canAdd(a) { writer.add(a) }
-        }
-        
-        // 读取器
-        guard let reader = try? AVAssetReader(asset: asset) else {
-            throw NSError(domain: "DonkeyYY", code: 12, userInfo: [NSLocalizedDescriptionKey: "无法创建读取器"])
-        }
-        
-        let videoReader = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
-        ])
-        if reader.canAdd(videoReader) { reader.add(videoReader) }
-        
-        var audioReader: AVAssetReaderTrackOutput? = nil
-        if !audioTracks.isEmpty {
-            audioReader = AVAssetReaderTrackOutput(track: audioTracks[0], outputSettings: nil)
-            if let a = audioReader, reader.canAdd(a) { reader.add(a) }
-        }
-        
-        writer.startWriting()
-        reader.startReading()
-        writer.startSession(atSourceTime: .zero)
-        
-        let group = DispatchGroup()
-        var transcodeError: Error? = nil
-        
-        group.enter()
-        videoInput.requestMediaDataWhenReady(on: DispatchQueue(label: "vt")) {
-            while videoInput.isReadyForMoreMediaData {
-                if let s = videoReader.copyNextSampleBuffer() {
-                    videoInput.append(s)
-                } else {
-                    videoInput.markAsFinished()
-                    group.leave()
-                    break
-                }
-            }
-        }
-        
-        if let audioInput = audioInput, let audioReader = audioReader {
-            group.enter()
-            audioInput.requestMediaDataWhenReady(on: DispatchQueue(label: "at")) {
-                while audioInput.isReadyForMoreMediaData {
-                    if let s = audioReader.copyNextSampleBuffer() {
-                        audioInput.append(s)
-                    } else {
-                        audioInput.markAsFinished()
-                        group.leave()
-                        break
-                    }
-                }
-            }
-        }
-        
-        group.wait()
-        
-        if reader.status != .completed { transcodeError = reader.error }
-        
-        let finishSem = DispatchSemaphore(value: 0)
-        writer.finishWriting {
-            if writer.status != .completed { transcodeError = writer.error }
-            finishSem.signal()
-        }
-        finishSem.wait()
-        
-        if let e = transcodeError { throw e }
-        if writer.status != .completed {
-            throw NSError(domain: "DonkeyYY", code: 13, userInfo: [NSLocalizedDescriptionKey: "写入失败"])
-        }
-    }
+
 
     // MARK: - 网络请求
     private func downloadString(url: String) throws -> String? {
